@@ -1,5 +1,3 @@
-// next improvements: when slicing storage[...], allow vectorized instructions
-// change the vectors in ActionNode 
 // Switch to CFR+ or DCFR
 
 use crate::Node::{PlayerAction, TerminalFold, TerminalShowdown};
@@ -12,10 +10,24 @@ pub enum Action {
 }
 
 pub struct ActionNode {
-    pub player: usize,
-    pub actions: Vec<Action>,
+    pub player: u8,
+    pub children_start: usize,
+    pub offset: usize,
+    pub num_actions: u8
+}
+
+pub struct GameTree {
+    pub num_hands: usize,
+    pub nodes: Vec<Node>,
     pub children: Vec<usize>,
-    pub offset: usize
+    pub actions: Vec<Action>,
+}
+
+impl GameTree {
+    #[inline]
+    fn get_children(&self, node: &ActionNode) -> &[usize]{
+        &self.children[node.children_start .. node.children_start+(node.num_actions as usize)]
+    }
 }
 
 pub struct CFRStorage {
@@ -91,39 +103,43 @@ pub enum Node {
     },
 }
 
-pub struct GameTree {
-    pub nodes: Vec<Node>,
-    pub num_hands: usize,
-}
-
 fn new_cfr() -> (GameTree, CFRStorage){
-    let mut tree = GameTree { nodes: Vec::new(), num_hands: 3 };
+    let mut tree = GameTree {nodes: Vec::with_capacity(8),
+                                       num_hands: 3,
+                                       children: Vec::with_capacity(8),
+                                       actions: Vec::with_capacity(8)};
     let storage = CFRStorage { regret_sum: vec![0.0;24], strategy_sum: vec![0.0;24]};
     // root #0
     tree.nodes.push(
         Node::PlayerAction(ActionNode {
             player: 0,
-            actions: vec![Action::Pass, Action::Bet],
-            children: vec![1,2],
-            offset: 0
+            children_start: 0,
+            offset: 0,
+            num_actions:2,
         })
     ); 
+    tree.children.extend([1,2]);
+    tree.actions.extend(vec![Action::Pass, Action::Bet]);
     tree.nodes.push(
         Node::PlayerAction(ActionNode {
             player: 1,
-            actions: vec![Action::Pass, Action::Bet],
-            children: vec![3,4],
-            offset: 6
+            children_start:2,
+            offset: 6,
+            num_actions:2,
         }) 
     ); // P0: PASS #1
+    tree.children.extend([3,4]);
+    tree.actions.extend(vec![Action::Pass, Action::Bet]);
     tree.nodes.push(
         Node::PlayerAction(ActionNode {
             player: 1,
-            actions: vec![Action::Pass, Action::Bet],
-            children: vec![5,6],
-            offset: 12
+            children_start:4,
+            offset: 12,
+            num_actions: 2,
         })
     ); // P0: BET - 2
+    tree.children.extend([5,6]);
+    tree.actions.extend(vec![Action::Pass, Action::Bet]);
     tree.nodes.push(
         Node::TerminalShowdown {pot:2.0}
     ); // P0: PASS -> P1: PASS #3
@@ -131,11 +147,13 @@ fn new_cfr() -> (GameTree, CFRStorage){
     tree.nodes.push(
         Node::PlayerAction(ActionNode {
             player: 0,
-            actions: vec![Action::Pass, Action::Bet],
-            children: vec![7,8],
-            offset: 18
+            children_start: 6,
+            offset: 18,
+            num_actions: 2,
         })
     ); // P0: PASS -> P1: BET #4  
+    tree.children.extend([7,8]);
+    tree.actions.extend(vec![Action::Pass, Action::Bet]);
 
     tree.nodes.push(
         Node::TerminalFold { folder: 1, pot: 3.0, p0_contrib: 2.0, p1_contrib:1.0 }
@@ -282,7 +300,7 @@ fn cfr_traverse(tree: &GameTree,
             v0_out.fill(0.0);
             v1_out.fill(0.0);
             let player = action.player;
-            let num_actions = action.children.len();
+            let num_actions = action.num_actions as usize;
 
             let (mut child_frame, 
                 v0_next, 
@@ -298,14 +316,15 @@ fn cfr_traverse(tree: &GameTree,
                 &storage.regret_sum[action.offset..action.offset+num_actions*num_hands], 
                 num_actions, 
                 num_hands);
-
+            
+            let children = tree.get_children(action);
             if player == 0 {
                 for i in 0..num_actions {
-                    let child_idx = action.children[i];
+                    let child_idx = children[i];
                     for j in 0..num_hands {
                         r_next[j] = r0[j] * strategy[i*num_hands+j];
                     }
-                    cfr_traverse(tree, storage, child_idx, &r_next, r1, v0_next, v1_next, &mut child_frame); 
+                    cfr_traverse(tree, storage, child_idx, r_next, r1, v0_next, v1_next, &mut child_frame); 
                     
                     for j in 0..num_hands {
                         vi_a[i*num_hands+j] = v0_next[j];
@@ -313,20 +332,33 @@ fn cfr_traverse(tree: &GameTree,
                         v1_out[j] += v1_next[j];  
                     }
                 }
+                // all the variable declarations below look useless.
+                // Actually, they inform the compiler that it does not have
+                // to do bound checks when writing some_var[index] because
+                // the arrays have the right size (num_hands). This allows the use
+                // of vectorized AVX2/NEON instructions in assembly, which
+                // make the code faster
+                let v0_loop = &v0_out[..num_hands];
+                let r0_loop = &r0[..num_hands];
                 for i in 0..num_actions {
+                    let row = i*num_hands;
+                    let regrets = &mut storage.regret_sum[action.offset+row..][..num_hands];
+                    let strategy_sum = &mut storage.strategy_sum[action.offset+row..][..num_hands];
+                    let action_ev = &vi_a[row..][..num_hands];
+                    let strat     = &strategy[row..][..num_hands];
                     for j in 0..num_hands {
-                        storage.regret_sum[action.offset+i*num_hands+j] += vi_a[i*num_hands+j]-v0_out[j];
-                        storage.strategy_sum[action.offset+i*num_hands+j] += strategy[i*num_hands+j]*r0[j];
+                        regrets[j] += action_ev[j]-v0_loop[j];
+                        strategy_sum[j] += strat[j]*r0_loop[j];
                     }
                 }
 
             } else {
                 for i in 0..num_actions {
-                    let child_idx = action.children[i];
+                    let child_idx = children[i];
                     for j in 0..num_hands {
                         r_next[j] = r1[j] * strategy[i*num_hands+j];
                     }
-                    cfr_traverse(tree, storage, child_idx, r0, &r_next, v0_next, v1_next, &mut child_frame); 
+                    cfr_traverse(tree, storage, child_idx, r0, r_next, v0_next, v1_next, &mut child_frame); 
                     
                     for j in 0..num_hands {
                         vi_a[i*num_hands+j] = v1_next[j];
@@ -334,10 +366,23 @@ fn cfr_traverse(tree: &GameTree,
                         v1_out[j] += v1_next[j] * strategy[i*num_hands+j];    
                     } 
                 }
+                // all the variable declarations below look useless.
+                // Actually, they inform the compiler that it does not have
+                // to do bound checks when writing some_var[index] because
+                // the arrays have the right size (num_hands). This allows the use
+                // of vectorized AVX2/NEON instructions in assembly, which
+                // make the code faster
+                let v1_loop = &v1_out[..num_hands];
+                let r1_loop = &r1[..num_hands];
                 for i in 0..num_actions {
+                    let row = i*num_hands;
+                    let regrets = &mut storage.regret_sum[action.offset+row..][..num_hands];
+                    let strategy_sum = &mut storage.strategy_sum[action.offset+row..][..num_hands];
+                    let action_ev = &vi_a[row..][..num_hands];
+                    let strat     = &strategy[row..][..num_hands];
                     for j in 0..num_hands {
-                        storage.regret_sum[action.offset+i*num_hands+j] += vi_a[i*num_hands+j]-v1_out[j];
-                        storage.strategy_sum[action.offset+i*num_hands+j] += strategy[i*num_hands+j]*r1[j];
+                        regrets[j] += action_ev[j]-v1_loop[j];
+                        strategy_sum[j] += strat[j]*r1_loop[j];
                     }
                 }
             }
@@ -380,7 +425,7 @@ fn main() {
 
     for (idx, label) in labels {
         if let Node::PlayerAction(node) = &tree.nodes[idx] {
-            let avg = average_strategy(&storage.strategy_sum[node.offset..node.offset+node.actions.len()*tree.num_hands], node.actions.len(), tree.num_hands);
+            let avg = average_strategy(&storage.strategy_sum[node.offset..node.offset+(node.num_actions as usize)*tree.num_hands], node.num_actions as usize, tree.num_hands);
             println!("{}", label);
             for (j, card) in cards.iter().enumerate() {
                 let pass = avg[j] * 100.0;
