@@ -1,3 +1,7 @@
+// next improvements: when slicing storage[...], allow vectorized instructions
+// change the vectors in ActionNode 
+// Switch to CFR+ or DCFR
+
 use crate::Node::{PlayerAction, TerminalFold, TerminalShowdown};
 
 
@@ -11,8 +15,7 @@ pub struct ActionNode {
     pub player: usize,
     pub actions: Vec<Action>,
     pub children: Vec<usize>,
-    pub offset: usize,
-    pub size: usize,
+    pub offset: usize
 }
 
 pub struct CFRStorage {
@@ -22,26 +25,28 @@ pub struct CFRStorage {
     pub strategy_sum: Vec<f32>
 }
 
-/// This function allows to compute a strategy given some regrets
+/// This function allows to compute a strategy (in place) given some regrets
 /// It expects the regrets to be in an array of size num_actions*num_hands,
 /// where the regret for action i and hand j is found at regrets[i*num_hands+j]
 /// It should typically be used on a slice of a regret_sum field in a  
 /// CFRStorage instance
-fn compute_strategy(strategy: &mut [f32], regrets: &[f32], num_actions: usize, num_hands: usize) {
+fn compute_strategy(strategy: &mut [f32], sum_scratch: &mut [f32], regrets: &[f32], num_actions: usize, num_hands: usize) {
     // strategy should have length: num_actions*num_hands
-    let mut sum: Vec<f32> = vec![0.0; num_hands];
+    // sum_scratch should have length: num_hands
+
+    sum_scratch.fill(0.0);
     
     let uniform = 1.0/(num_actions as f32);
 
     for i in 0..num_actions {
         for j in 0..num_hands {
-            sum[j] += regrets[i*num_hands+j].max(0.0);
+            sum_scratch[j] += regrets[i*num_hands+j].max(0.0);
         } 
     }
 
     for i in 0..num_actions {
         for j in 0..num_hands {
-            strategy[i*num_hands+j] = if sum[j] > 0.0 {regrets[i*num_hands+j].max(0.0)/sum[j]} else {uniform};
+            strategy[i*num_hands+j] = if sum_scratch[j] > 0.0 {regrets[i*num_hands+j].max(0.0)/sum_scratch[j]} else {uniform};
         }
     } 
 }
@@ -100,8 +105,7 @@ fn new_cfr() -> (GameTree, CFRStorage){
             player: 0,
             actions: vec![Action::Pass, Action::Bet],
             children: vec![1,2],
-            offset: 0,
-            size: 6
+            offset: 0
         })
     ); 
     tree.nodes.push(
@@ -109,8 +113,7 @@ fn new_cfr() -> (GameTree, CFRStorage){
             player: 1,
             actions: vec![Action::Pass, Action::Bet],
             children: vec![3,4],
-            offset: 6,
-            size: 6
+            offset: 6
         }) 
     ); // P0: PASS #1
     tree.nodes.push(
@@ -118,8 +121,7 @@ fn new_cfr() -> (GameTree, CFRStorage){
             player: 1,
             actions: vec![Action::Pass, Action::Bet],
             children: vec![5,6],
-            offset: 12,
-            size: 6
+            offset: 12
         })
     ); // P0: BET - 2
     tree.nodes.push(
@@ -131,8 +133,7 @@ fn new_cfr() -> (GameTree, CFRStorage){
             player: 0,
             actions: vec![Action::Pass, Action::Bet],
             children: vec![7,8],
-            offset: 18,
-            size: 6
+            offset: 18
         })
     ); // P0: PASS -> P1: BET #4  
 
@@ -155,67 +156,148 @@ fn new_cfr() -> (GameTree, CFRStorage){
     (tree, storage)
 }
 
+pub struct ScratchPad {
+    pub v0: Vec<f32>, // vec![0.0;num_hands]
+    pub v1: Vec<f32>, // vec![0.0;num_hands]
+    pub r_next: Vec<f32>, //= vec![0.0;num_hands];
+    pub vi_a: Vec<f32>, // vec![0.0;num_actions*num_hands];
+    pub strategy: Vec<f32>, //= vec![0.0;num_actions*num_hands]; 
+    pub sum_scratch: Vec<f32>, // vec![0.0;num_hands]; 
+}
+
+impl ScratchPad {
+    fn new(depth: usize, max_actions: usize, max_hands: usize) -> Self {
+        ScratchPad {
+            v0: vec![0.0;max_hands*depth],
+            v1: vec![0.0;max_hands*depth],
+            r_next: vec![0.0;max_hands*depth],
+            vi_a: vec![0.0;max_actions*max_hands*depth],
+            strategy: vec![0.0;max_actions*max_hands*depth],
+            sum_scratch: vec![0.0;max_hands],
+        }
+    }
+    // could be written as (using elision rules):
+    // fn get_frame(&mut self) -> ScratchFrame<'_> {
+    fn get_frame<'a>(&'a mut self) -> ScratchFrame<'a> {
+        ScratchFrame { 
+            v0: &mut self.v0,
+            v1: &mut self.v1, 
+            r_next: &mut self.r_next, 
+            vi_a: &mut self.vi_a, 
+            sum_scratch: &mut self.sum_scratch, 
+            strategy: &mut self.strategy 
+        }
+    }
+}
+
+pub struct ScratchFrame<'a> {
+    pub v0: &'a mut [f32],
+    pub v1: &'a mut [f32], 
+    pub r_next: &'a mut [f32], 
+    pub vi_a: &'a mut [f32], 
+    pub sum_scratch: &'a mut [f32], 
+    pub strategy: &'a mut [f32]
+}
+
+impl<'a> ScratchFrame<'a> {
+    // self here is of type ScratchFrame<'a>
+    // Therefore, &'b mut self forces lifetime b to 
+    // be shorter than lifetime a
+    #[inline]
+    fn split<'b>(&'b mut self,
+                 num_actions: usize,
+                 num_hands: usize) -> 
+                 (ScratchFrame<'b>,
+                  &'b mut [f32], 
+                  &'b mut [f32], 
+                  &'b mut [f32], 
+                  &'b mut [f32], 
+                  &'b mut [f32]) {
+        let (v0, v0_child) = self.v0.split_at_mut(num_hands);
+        let (v1, v1_child) = self.v1.split_at_mut(num_hands);
+        let (r, r_child ) = self.r_next.split_at_mut(num_hands);
+        let (vi_a, vi_a_child) = self.vi_a.split_at_mut(num_hands*num_actions);
+        let (strategy, strategy_child) = self.strategy.split_at_mut(num_hands*num_actions);
+        
+        let child_frame = ScratchFrame {
+            v0: v0_child,
+            v1: v1_child,
+            r_next: r_child,
+            vi_a: vi_a_child,
+            sum_scratch: &mut *self.sum_scratch,
+            strategy: strategy_child
+        };
+        
+
+        (child_frame, v0, v1, r, vi_a, strategy)
+
+    }
+}
+
 
 fn cfr_traverse(tree: &GameTree, 
                 storage: &mut CFRStorage,
                 node_idx: usize,
                 r0: &[f32],
-                r1: &[f32]) -> (Vec<f32>, Vec<f32>){
+                r1: &[f32],
+                v0_out: &mut [f32],
+                v1_out: &mut [f32],
+                scratch: &mut ScratchFrame<'_>){
     
     let num_hands = tree.num_hands;
-
-    let mut v0: Vec<f32> = vec![0.0;num_hands]; // allocation
-    let mut v1: Vec<f32> = vec![0.0;num_hands]; // allocation
 
     match &tree.nodes[node_idx] {
         TerminalFold {folder,p0_contrib,p1_contrib, ..} => {
             if *folder == 0 {
-                // Intuitively, I would write
-                // let u0: Vec<f32> = vec![-*p0_contrib;tree.num_hands];
-                // u1[0] = *p0_contrib * (r0[1]+ r0[2]);
-                // but those aren't needed because multiplying automatically dereferences
-                v0[0] = -p0_contrib * (r1[1] + r1[2]);
-                v0[1] = -p0_contrib * (r1[0] + r1[2]);
-                v0[2] = -p0_contrib * (r1[0] + r1[1]);
+                // writing *p0_contrib * ... isn't needed because
+                // multiplying automatically dereferences
+                v0_out[0] = -p0_contrib * (r1[1] + r1[2]);
+                v0_out[1] = -p0_contrib * (r1[0] + r1[2]);
+                v0_out[2] = -p0_contrib * (r1[0] + r1[1]);
                 
-                v1[0] = p0_contrib * (r0[1]+ r0[2]);
-                v1[1] = p0_contrib * (r0[0]+ r0[2]);
-                v1[2] = p0_contrib * (r0[0]+ r0[1]);
-                return (v0, v1);
-            } 
-            // else folder=1
-            v0[0] = p1_contrib * (r1[1]+ r1[2]);
-            v0[1] = p1_contrib * (r1[0]+ r1[2]);
-            v0[2] = p1_contrib * (r1[0]+ r1[1]);
+                v1_out[0] = p0_contrib * (r0[1]+ r0[2]);
+                v1_out[1] = p0_contrib * (r0[0]+ r0[2]);
+                v1_out[2] = p0_contrib * (r0[0]+ r0[1]);
+            } else {
+                // else folder=1
+                v0_out[0] = p1_contrib * (r1[1]+ r1[2]);
+                v0_out[1] = p1_contrib * (r1[0]+ r1[2]);
+                v0_out[2] = p1_contrib * (r1[0]+ r1[1]);
 
-            v1[0] = -p1_contrib * (r0[1]+ r0[2]);
-            v1[1] = -p1_contrib * (r0[0]+ r0[2]);
-            v1[2] = -p1_contrib * (r0[0]+ r0[1]);
-            return (v0, v1);
+                v1_out[0] = -p1_contrib * (r0[1]+ r0[2]);
+                v1_out[1] = -p1_contrib * (r0[0]+ r0[2]);
+                v1_out[2] = -p1_contrib * (r0[0]+ r0[1]);
+            }  
         },
         TerminalShowdown {pot} => {
-            v0[0] = -pot/2.0 * (r1[1]+r1[2]);
-            v0[1] = pot/2.0 * (r1[0]- r1[2]);
-            v0[2] = pot/2.0 * (r1[0] + r1[1]);
+            v0_out[0] = -pot/2.0 * (r1[1]+r1[2]);
+            v0_out[1] = pot/2.0 * (r1[0]- r1[2]);
+            v0_out[2] = pot/2.0 * (r1[0] + r1[1]);
 
-            v1[0] = -pot/2.0 * (r0[1]+r0[2]);
-            v1[1] = pot/2.0 * (r0[0]- r0[2]);
-            v1[2] = pot/2.0 * (r0[0] + r0[1]);
-
-            return (v0, v1);
+            v1_out[0] = -pot/2.0 * (r0[1]+r0[2]);
+            v1_out[1] = pot/2.0 * (r0[0]- r0[2]);
+            v1_out[2] = pot/2.0 * (r0[0] + r0[1]);
         },
         PlayerAction(action) => {
+            v0_out.fill(0.0);
+            v1_out.fill(0.0);
             let player = action.player;
             let num_actions = action.children.len();
 
-            let mut r_next: Vec<f32> = vec![0.0;num_hands]; // allocation
+            let (mut child_frame, 
+                v0_next, 
+                v1_next, 
+                r_next, 
+                vi_a, 
+                strategy) = scratch.split(num_actions, num_hands);
 
-            let mut vi_a: Vec<f32> = vec![0.0;num_actions*num_hands]; // allocation
-
-            let mut strategy: Vec<f32> = vec![0.0;num_actions*num_hands]; // allocation
-
-            // strategy is computed in place on strategy
-            compute_strategy(&mut strategy, &storage.regret_sum[action.offset..action.offset+action.size], num_actions, num_hands);
+            // the strategy is computed in place on strategy
+            compute_strategy(
+                strategy, 
+                child_frame.sum_scratch,
+                &storage.regret_sum[action.offset..action.offset+num_actions*num_hands], 
+                num_actions, 
+                num_hands);
 
             if player == 0 {
                 for i in 0..num_actions {
@@ -223,17 +305,17 @@ fn cfr_traverse(tree: &GameTree,
                     for j in 0..num_hands {
                         r_next[j] = r0[j] * strategy[i*num_hands+j];
                     }
-                    let (v0_next, v1_next) = cfr_traverse(tree, storage, child_idx, &r_next, r1); 
+                    cfr_traverse(tree, storage, child_idx, &r_next, r1, v0_next, v1_next, &mut child_frame); 
                     
                     for j in 0..num_hands {
                         vi_a[i*num_hands+j] = v0_next[j];
-                        v0[j] += v0_next[j] * strategy[i*num_hands+j];
-                        v1[j] += v1_next[j];  
+                        v0_out[j] += v0_next[j] * strategy[i*num_hands+j];
+                        v1_out[j] += v1_next[j];  
                     }
                 }
                 for i in 0..num_actions {
                     for j in 0..num_hands {
-                        storage.regret_sum[action.offset+i*num_hands+j] += vi_a[i*num_hands+j]-v0[j];
+                        storage.regret_sum[action.offset+i*num_hands+j] += vi_a[i*num_hands+j]-v0_out[j];
                         storage.strategy_sum[action.offset+i*num_hands+j] += strategy[i*num_hands+j]*r0[j];
                     }
                 }
@@ -244,23 +326,21 @@ fn cfr_traverse(tree: &GameTree,
                     for j in 0..num_hands {
                         r_next[j] = r1[j] * strategy[i*num_hands+j];
                     }
-                    let (v0_next, v1_next) = cfr_traverse(tree, storage, child_idx, r0, &r_next); 
+                    cfr_traverse(tree, storage, child_idx, r0, &r_next, v0_next, v1_next, &mut child_frame); 
                     
                     for j in 0..num_hands {
                         vi_a[i*num_hands+j] = v1_next[j];
-                        v0[j] += v0_next[j];
-                        v1[j] += v1_next[j] * strategy[i*num_hands+j];    
+                        v0_out[j] += v0_next[j];
+                        v1_out[j] += v1_next[j] * strategy[i*num_hands+j];    
                     } 
                 }
                 for i in 0..num_actions {
                     for j in 0..num_hands {
-                        storage.regret_sum[action.offset+i*num_hands+j] += vi_a[i*num_hands+j]-v1[j];
+                        storage.regret_sum[action.offset+i*num_hands+j] += vi_a[i*num_hands+j]-v1_out[j];
                         storage.strategy_sum[action.offset+i*num_hands+j] += strategy[i*num_hands+j]*r1[j];
                     }
                 }
             }
-
-            (v0, v1)
         }
     }
 
@@ -272,11 +352,16 @@ fn main() {
     let iterations = 1_000_000;
     let r0 = [1.0_f32; 3];
     let r1 = [1.0_f32; 3];
+    let mut v0_out = [0.0_f32; 3];
+    let mut v1_out = [0.0_f32; 3];
+    let mut scratch_pad = ScratchPad::new(3, 2, 3);
+    let mut frame = scratch_pad.get_frame();
     let mut p0_ev_sum = 0.0_f64;
 
     for _ in 0..iterations {
-        let (v0, _) = cfr_traverse(&tree,&mut storage, 0, &r0, &r1);
-        p0_ev_sum += (v0.iter().sum::<f32>() / 6.0) as f64;
+
+        cfr_traverse(&tree,&mut storage, 0, &r0, &r1, &mut v0_out, &mut v1_out, &mut frame);
+        p0_ev_sum += (v0_out.iter().sum::<f32>() / 6.0) as f64;
     }
 
     println!(
@@ -295,7 +380,7 @@ fn main() {
 
     for (idx, label) in labels {
         if let Node::PlayerAction(node) = &tree.nodes[idx] {
-            let avg = average_strategy(&storage.strategy_sum[node.offset..node.offset+node.size], node.actions.len(), tree.num_hands);
+            let avg = average_strategy(&storage.strategy_sum[node.offset..node.offset+node.actions.len()*tree.num_hands], node.actions.len(), tree.num_hands);
             println!("{}", label);
             for (j, card) in cards.iter().enumerate() {
                 let pass = avg[j] * 100.0;
